@@ -1,2 +1,9 @@
-# aptv-auto
-Automatically updated M3U playlist: one stream per channel, preserving metadata.
+# APTV 自动去重订阅
+
+订阅地址：https://raw.githubusercontent.com/Kyle0548/aptv-auto/main/result.m3u
+
+每 6 小时自动抓取一次指定来源；同名频道保留一条线路，保留台标、EPG、分组及所选线路的播放选项。优先选择媒体片段可访问且分辨率标注较高的线路；全部探测失败时保留来源中的首条线路，避免丢失频道。不同频道不合并，单独的更新时间提示转为注释。
+
+探测来自 GitHub 运行环境，不能保证 iOS 所在网络均可播放。源地址可能提供旧列表，状态中的源更新时间可供核对。抓取失败时工作流报错并保留上次结果。
+
+运行结果见 [status.json](status.json)；也可在 Actions 中手动运行。GitHub 定时任务可能延迟或被平台停用，若长时间不更新请查看 Actions。
