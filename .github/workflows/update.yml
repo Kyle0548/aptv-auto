@@ -1,0 +1,142 @@
+name: Update APTV playlist
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */6 * * *'
+  push:
+    paths:
+      - '.github/workflows/update.yml'
+permissions:
+  contents: write
+concurrency:
+  group: aptv-update
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure video probe is available
+        run: command -v ffprobe || (sudo apt-get update -qq && sudo apt-get install -y ffmpeg)
+      - name: Fetch, probe and deduplicate
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures as cf
+          import datetime, json, os, re, subprocess, time, unicodedata
+          import urllib.request
+          from pathlib import Path
+          SOURCE = 'https://gh-proxy.com/https://raw.githubusercontent.com/Guovin/iptv-api/gd/output/result.m3u'
+          def fetch():
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(SOURCE, headers={'User-Agent': 'Mozilla/5.0'})
+                      with urllib.request.urlopen(req, timeout=60) as r:
+                          data = r.read(20_000_001)
+                      if len(data) > 20_000_000:
+                          raise ValueError('Source too large')
+                      text = data.decode('utf-8-sig')
+                      if not text.lstrip().startswith('#EXTM3U'):
+                          raise ValueError('Not an extended M3U playlist')
+                      return text
+                  except Exception:
+                      if attempt == 2:
+                          raise
+                      time.sleep(5)
+          text = fetch()
+          lines = text.splitlines()
+          header = [lines[0]]
+          groups = {}
+          pending = []
+          source_entries = 0
+          update_labels = []
+          def name_of(info):
+              match = re.match(r'^#EXTINF:(?:[^",]|"[^"]*")*,(.*)$', info)
+              if not match:
+                  raise ValueError('Malformed EXTINF: ' + info)
+              return match.group(1).strip()
+          def key(name):
+              return unicodedata.normalize('NFKC', name).strip().casefold()
+          for line in lines[1:]:
+              line = line.strip()
+              if not line:
+                  continue
+              if line.startswith('#EXTINF:'):
+                  pending = [line]
+              elif pending:
+                  pending.append(line)
+                  if not line.startswith('#'):
+                      name = name_of(pending[0])
+                      source_entries += 1
+                      if re.search(r'group-title="[^"]*更新时间', pending[0]) and re.match(r'^20\d\d-\d\d-\d\d', name):
+                          update_labels.append(name)
+                      else:
+                          if not name:
+                              raise ValueError('Empty channel name')
+                          groups.setdefault(key(name), []).append({'name': name, 'block': pending[:], 'url': line})
+                      pending = []
+              elif line.startswith('#') and not line.startswith('#EXTM3U'):
+                  header.append(line)
+          if not groups or pending:
+              raise ValueError('Empty or truncated source; keeping last published playlist')
+          def probe(entry):
+              cmd = ['ffprobe', '-v', 'error', '-rw_timeout', '5000000', '-analyzeduration', '2000000', '-probesize', '1000000']
+              for line in entry['block']:
+                  for option, flag in [('http-user-agent=', '-user_agent'), ('http-referrer=', '-referer')]:
+                      if line.startswith('#EXTVLCOPT:' + option):
+                          cmd += [flag, line.split('=', 1)[1]]
+              cmd += ['-i', entry['url'], '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'json']
+              start = time.monotonic()
+              try:
+                  p = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                  streams = json.loads(p.stdout).get('streams', [])
+                  area = max((int(s.get('width', 0)) * int(s.get('height', 0)) for s in streams), default=0)
+                  return (int(p.returncode == 0 and area > 0), area, -round(time.monotonic() - start, 2))
+              except Exception:
+                  return (0, 0, -10)
+          unique = {}
+          for entries in groups.values():
+              for entry in entries:
+                  entry['cache'] = tuple(entry['block'][1:])
+                  unique.setdefault(entry['cache'], entry)
+          print(f'Probing {len(unique)} unique streams for {len(groups)} channels', flush=True)
+          results = {}
+          with cf.ThreadPoolExecutor(max_workers=40) as pool:
+              futures = {pool.submit(probe, e): k for k, e in unique.items()}
+              for i, f in enumerate(cf.as_completed(futures), 1):
+                  results[futures[f]] = f.result()
+                  if i % 200 == 0:
+                      print(f'Probed {i}/{len(unique)}', flush=True)
+          selected = []
+          verified = 0
+          for entries in groups.values():
+              valid = [e for e in entries if results[e['cache']][0]]
+              chosen = max(valid, key=lambda e: results[e['cache']][1:]) if valid else entries[0]
+              verified += bool(valid)
+              selected.append(chosen)
+          assert len(selected) == len(groups)
+          assert len({key(e['name']) for e in selected}) == len(groups)
+          now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+          output = header + ['# Generated at ' + now, '# Source: ' + SOURCE]
+          output += ['# Upstream update label: ' + label for label in update_labels]
+          for entry in selected:
+              output.extend(entry['block'])
+          Path('result.m3u').write_text('\n'.join(output) + '\n', encoding='utf-8')
+          report = {'generated_utc': now, 'source': SOURCE, 'source_update_labels': update_labels, 'source_entries': source_entries, 'channels': len(groups), 'verified_video_channels': verified, 'fallback_channels': len(groups) - verified, 'unique_streams_probed': len(unique)}
+          Path('status.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          summary = json.dumps(report, ensure_ascii=False, indent=2)
+          print(summary)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('### APTV playlist update\n\n' + chr(96)*3 + 'json\n' + summary + '\n' + chr(96)*3 + '\n')
+          Path('README.md').write_text('# APTV 自动去重订阅\n\n订阅地址：https://raw.githubusercontent.com/' + os.environ['GITHUB_REPOSITORY'] + '/main/result.m3u\n\n每 6 小时自动抓取一次指定来源；同名频道保留一条线路，保留台标、EPG、分组及所选线路的播放选项。优先选择探测到视频且分辨率较高的线路；全部探测失败时保留来源中的首条线路，避免丢失频道。不同频道不合并，单独的更新时间提示转为注释。\n\n探测来自 GitHub 运行环境，不能保证 iOS 所在网络均可播放。源地址可能提供旧列表，状态中的源更新时间可供核对。抓取失败时工作流报错并保留上次结果。\n\n运行结果见 [status.json](status.json)；也可在 Actions 中手动运行。GitHub 定时任务可能延迟或被平台停用，若长时间不更新请查看 Actions。\n', encoding='utf-8')
+          PY
+      - name: Publish playlist and update status
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add result.m3u status.json README.md
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update deduplicated APTV playlist'
+            git push
+          fi
