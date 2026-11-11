@@ -17,15 +17,13 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Ensure video probe is available
-        run: command -v ffprobe || (sudo apt-get update -qq && sudo apt-get install -y ffmpeg)
       - name: Fetch, probe and deduplicate
         shell: bash
         run: |
           python3 - <<'PY'
           import concurrent.futures as cf
           import datetime, json, os, re, subprocess, time, unicodedata
-          import urllib.request
+          import urllib.request, urllib.parse
           from pathlib import Path
           SOURCE = 'https://gh-proxy.com/https://raw.githubusercontent.com/Guovin/iptv-api/gd/output/result.m3u'
           def fetch():
@@ -81,20 +79,54 @@ jobs:
           if not groups or pending:
               raise ValueError('Empty or truncated source; keeping last published playlist')
           def probe(entry):
-              cmd = ['ffprobe', '-v', 'error', '-rw_timeout', '5000000', '-analyzeduration', '2000000', '-probesize', '1000000']
+              headers = {'User-Agent': 'Mozilla/5.0'}
               for line in entry['block']:
-                  for option, flag in [('http-user-agent=', '-user_agent'), ('http-referrer=', '-referer')]:
+                  for option, header_name in [('http-user-agent=', 'User-Agent'), ('http-referrer=', 'Referer')]:
                       if line.startswith('#EXTVLCOPT:' + option):
-                          cmd += [flag, line.split('=', 1)[1]]
-              cmd += ['-i', entry['url'], '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'json']
+                          headers[header_name] = line.split('=', 1)[1]
               start = time.monotonic()
+              hint = re.search(r'(2160|1080|720|576|480)[pP]', entry['url'])
+              area = int(hint[1])**2*16//9 if hint else 0
+              bandwidth = 0
+              url = entry['url']
               try:
-                  p = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                  streams = json.loads(p.stdout).get('streams', [])
-                  area = max((int(s.get('width', 0)) * int(s.get('height', 0)) for s in streams), default=0)
-                  return (int(p.returncode == 0 and area > 0), area, -round(time.monotonic() - start, 2))
+                  for depth in range(4):
+                      if urllib.parse.urlsplit(url).scheme not in ('http', 'https'):
+                          return (0, 0, 0, -99)
+                      req = urllib.request.Request(url, headers=headers)
+                      with urllib.request.urlopen(req, timeout=4) as response:
+                          data = response.read(131072 if depth == 0 else 32768)
+                          base = response.geturl()
+                          mime = response.headers.get('Content-Type', '').lower()
+                      if data.lstrip().startswith(b'#EXTM3U'):
+                          playlist = data.decode('utf-8-sig').splitlines()
+                          variants = []
+                          for i, line in enumerate(playlist):
+                              if line.startswith('#EXT-X-STREAM-INF:'):
+                                  resolution = re.search(r'RESOLUTION=(\d+)x(\d+)', line)
+                                  a = int(resolution[1])*int(resolution[2]) if resolution else 0
+                                  rate = re.search(r'(?:^|[, :])BANDWIDTH=(\d+)', line)
+                                  b = int(rate[1]) if rate else 0
+                                  next_url = next((v.strip() for v in playlist[i+1:] if v.strip() and not v.startswith('#')), None)
+                                  if next_url:
+                                      variants.append((a, b, urllib.parse.urljoin(base, next_url)))
+                          if variants:
+                              area, bandwidth, url = max(variants)
+                              continue
+                          segment = next((v.strip() for v in playlist if v.strip() and not v.startswith('#')), None)
+                          if not segment:
+                              return (0, 0, 0, -99)
+                          url = urllib.parse.urljoin(base, segment)
+                          continue
+                      # Check actual TS/MP4 media bytes, not an HTML error page.
+                      ts = any(data[o:o+1] == b'G' and data[o+188:o+189] == b'G' for o in range(min(188, max(0, len(data)-188))))
+                      mp4 = data[4:8] in (b'ftyp', b'styp', b'moof', b'mdat')
+                      if len(data) >= 188 and (ts or mp4 or mime.startswith('video/')):
+                          return (1, area, bandwidth, -round(time.monotonic()-start, 2))
+                      return (0, 0, 0, -99)
               except Exception:
-                  return (0, 0, -10)
+                  pass
+              return (0, 0, 0, -99)
           unique = {}
           for entries in groups.values():
               for entry in entries:
@@ -102,7 +134,7 @@ jobs:
                   unique.setdefault(entry['cache'], entry)
           print(f'Probing {len(unique)} unique streams for {len(groups)} channels', flush=True)
           results = {}
-          with cf.ThreadPoolExecutor(max_workers=40) as pool:
+          with cf.ThreadPoolExecutor(max_workers=64) as pool:
               futures = {pool.submit(probe, e): k for k, e in unique.items()}
               for i, f in enumerate(cf.as_completed(futures), 1):
                   results[futures[f]] = f.result()
@@ -123,13 +155,13 @@ jobs:
           for entry in selected:
               output.extend(entry['block'])
           Path('result.m3u').write_text('\n'.join(output) + '\n', encoding='utf-8')
-          report = {'generated_utc': now, 'source': SOURCE, 'source_update_labels': update_labels, 'source_entries': source_entries, 'channels': len(groups), 'verified_video_channels': verified, 'fallback_channels': len(groups) - verified, 'unique_streams_probed': len(unique)}
+          report = {'generated_utc': now, 'source': SOURCE, 'source_update_labels': update_labels, 'source_entries': source_entries, 'channels': len(groups), 'reachable_media_channels': verified, 'fallback_channels': len(groups) - verified, 'unique_streams_probed': len(unique)}
           Path('status.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
           summary = json.dumps(report, ensure_ascii=False, indent=2)
           print(summary)
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
               f.write('### APTV playlist update\n\n' + chr(96)*3 + 'json\n' + summary + '\n' + chr(96)*3 + '\n')
-          Path('README.md').write_text('# APTV 自动去重订阅\n\n订阅地址：https://raw.githubusercontent.com/' + os.environ['GITHUB_REPOSITORY'] + '/main/result.m3u\n\n每 6 小时自动抓取一次指定来源；同名频道保留一条线路，保留台标、EPG、分组及所选线路的播放选项。优先选择探测到视频且分辨率较高的线路；全部探测失败时保留来源中的首条线路，避免丢失频道。不同频道不合并，单独的更新时间提示转为注释。\n\n探测来自 GitHub 运行环境，不能保证 iOS 所在网络均可播放。源地址可能提供旧列表，状态中的源更新时间可供核对。抓取失败时工作流报错并保留上次结果。\n\n运行结果见 [status.json](status.json)；也可在 Actions 中手动运行。GitHub 定时任务可能延迟或被平台停用，若长时间不更新请查看 Actions。\n', encoding='utf-8')
+          Path('README.md').write_text('# APTV 自动去重订阅\n\n订阅地址：https://raw.githubusercontent.com/' + os.environ['GITHUB_REPOSITORY'] + '/main/result.m3u\n\n每 6 小时自动抓取一次指定来源；同名频道保留一条线路，保留台标、EPG、分组及所选线路的播放选项。优先选择媒体片段可访问且分辨率标注较高的线路；全部探测失败时保留来源中的首条线路，避免丢失频道。不同频道不合并，单独的更新时间提示转为注释。\n\n探测来自 GitHub 运行环境，不能保证 iOS 所在网络均可播放。源地址可能提供旧列表，状态中的源更新时间可供核对。抓取失败时工作流报错并保留上次结果。\n\n运行结果见 [status.json](status.json)；也可在 Actions 中手动运行。GitHub 定时任务可能延迟或被平台停用，若长时间不更新请查看 Actions。\n', encoding='utf-8')
           PY
       - name: Publish playlist and update status
         run: |
