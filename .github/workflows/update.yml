@@ -26,23 +26,30 @@ jobs:
           import urllib.request, urllib.parse
           from pathlib import Path
           SOURCE = 'https://gh-proxy.com/https://raw.githubusercontent.com/Guovin/iptv-api/gd/output/result.m3u'
+          UPSTREAM = 'https://raw.githubusercontent.com/Guovin/iptv-api/gd/output/result.m3u'
           def fetch():
+              errors = []
               for attempt in range(3):
-                  try:
-                      req = urllib.request.Request(SOURCE, headers={'User-Agent': 'Mozilla/5.0'})
-                      with urllib.request.urlopen(req, timeout=60) as r:
-                          data = r.read(20_000_001)
-                      if len(data) > 20_000_000:
-                          raise ValueError('Source too large')
-                      text = data.decode('utf-8-sig')
-                      if not text.lstrip().startswith('#EXTM3U'):
-                          raise ValueError('Not an extended M3U playlist')
-                      return text
-                  except Exception:
-                      if attempt == 2:
-                          raise
-                      time.sleep(5)
-          text = fetch()
+                  for url in (UPSTREAM, SOURCE):
+                      try:
+                          req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                          with urllib.request.urlopen(req, timeout=30) as r:
+                              data = r.read(20_000_001)
+                          if len(data) > 20_000_000:
+                              raise ValueError('Source too large')
+                          text = data.decode('utf-8-sig').lstrip()
+                          if not text.startswith('#EXTM3U') or '#EXTINF:' not in text:
+                              raise ValueError('Not a nonempty extended M3U playlist')
+                          print(f'Fetched playlist from {url}', flush=True)
+                          return text, url
+                      except Exception as error:
+                          message = f'{url}: {type(error).__name__}: {error}'
+                          print(f'Source attempt {attempt + 1} failed: {message}', flush=True)
+                          errors.append(message)
+                  if attempt < 2:
+                      time.sleep(5 * (attempt + 1))
+              raise RuntimeError('All source downloads failed; keeping last published playlist. ' + '; '.join(errors))
+          text, fetched_from = fetch()
           lines = text.splitlines()
           header = [lines[0]]
           groups = {}
@@ -150,18 +157,18 @@ jobs:
           assert len(selected) == len(groups)
           assert len({key(e['name']) for e in selected}) == len(groups)
           now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-          output = header + ['# Generated at ' + now, '# Source: ' + SOURCE]
+          output = header + ['# Generated at ' + now, '# Source: ' + SOURCE, '# Fetched from: ' + fetched_from]
           output += ['# Upstream update label: ' + label for label in update_labels]
           for entry in selected:
               output.extend(entry['block'])
           Path('result.m3u').write_text('\n'.join(output) + '\n', encoding='utf-8')
-          report = {'generated_utc': now, 'source': SOURCE, 'source_update_labels': update_labels, 'source_entries': source_entries, 'channels': len(groups), 'reachable_media_channels': verified, 'fallback_channels': len(groups) - verified, 'unique_streams_probed': len(unique)}
+          report = {'generated_utc': now, 'source': SOURCE, 'fetched_from': fetched_from, 'source_update_labels': update_labels, 'source_entries': source_entries, 'channels': len(groups), 'reachable_media_channels': verified, 'fallback_channels': len(groups) - verified, 'unique_streams_probed': len(unique)}
           Path('status.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
           summary = json.dumps(report, ensure_ascii=False, indent=2)
           print(summary)
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
               f.write('### APTV playlist update\n\n' + chr(96)*3 + 'json\n' + summary + '\n' + chr(96)*3 + '\n')
-          Path('README.md').write_text('# APTV 自动去重订阅\n\n订阅地址：https://raw.githubusercontent.com/' + os.environ['GITHUB_REPOSITORY'] + '/main/result.m3u\n\n每 6 小时自动抓取一次指定来源；同名频道保留一条线路，保留台标、EPG、分组及所选线路的播放选项。优先选择媒体片段可访问且分辨率标注较高的线路；全部探测失败时保留来源中的首条线路，避免丢失频道。不同频道不合并，单独的更新时间提示转为注释。\n\n探测来自 GitHub 运行环境，不能保证 iOS 所在网络均可播放。源地址可能提供旧列表，状态中的源更新时间可供核对。抓取失败时工作流报错并保留上次结果。\n\n运行结果见 [status.json](status.json)；也可在 Actions 中手动运行。GitHub 定时任务可能延迟或被平台停用，若长时间不更新请查看 Actions。\n', encoding='utf-8')
+          Path('README.md').write_text('# APTV 自动去重订阅\n\n订阅地址：https://raw.githubusercontent.com/' + os.environ['GITHUB_REPOSITORY'] + '/main/result.m3u\n\n每 6 小时自动抓取一次指定来源（优先直连 GitHub 原始文件，中转地址作为备用，并自动重试）；同名频道保留一条线路，保留台标、EPG、分组及所选线路的播放选项。优先选择媒体片段可访问且分辨率标注较高的线路；全部探测失败时保留来源中的首条线路，避免丢失频道。不同频道不合并，单独的更新时间提示转为注释。\n\n探测来自 GitHub 运行环境，不能保证 iOS 所在网络均可播放。源地址可能提供旧列表，状态中的源更新时间可供核对。抓取失败时工作流报错并保留上次结果。\n\n运行结果见 [status.json](status.json)；也可在 Actions 中手动运行。GitHub 定时任务可能延迟或被平台停用，若长时间不更新请查看 Actions。\n', encoding='utf-8')
           PY
       - name: Publish playlist and update status
         run: |
