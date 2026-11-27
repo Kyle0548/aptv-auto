@@ -1,5 +1,5 @@
 {
-  "generated_utc": "2026-11-27T08:47:13.855073+00:00",
+  "generated_utc": "2026-11-27T21:28:07.965419+00:00",
   "source": "https://gh-proxy.com/https://raw.githubusercontent.com/Guovin/iptv-api/gd/output/result.m3u",
   "fetched_from": "https://raw.githubusercontent.com/Guovin/iptv-api/gd/output/result.m3u",
   "source_update_labels": [
@@ -7,7 +7,7 @@
   ],
   "source_entries": 1619,
   "channels": 588,
-  "reachable_media_channels": 251,
-  "fallback_channels": 337,
+  "reachable_media_channels": 231,
+  "fallback_channels": 357,
   "unique_streams_probed": 1554
 }
